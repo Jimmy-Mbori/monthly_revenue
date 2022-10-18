@@ -1,0 +1,56 @@
+with 
+dates as (SELECT * FROM  UNNEST(GENERATE_DATE_ARRAY('2022-02-06',date_add(CURRENT_DATE(),interval 31 day), INTERVAL 1 DAY)) AS date),
+monthly_sale_days as (select distinct date_trunc(date,month)as month, count(distinct date) as count_of_sales_days from dates group by 1 order by 1),
+planned_revenue_data as (SELECT * FROM `upload_planned_revenue` order by 1),
+delivery_note_with_index as (
+                            SELECT *, 
+                            row_number()over(partition by name order by modified desc) as index 
+                            FROM `delivery_note`
+                            where workflow_state in ('PAID','DELIVERED')
+                            ),
+delivery_note_with_items as (
+                              select distinct dn.posting_date,
+                              dn.company,
+                              dn.customer,
+                              dni.against_sales_order as sales_order,
+                              sum(dni.amount) as revenue,
+                              from delivery_note_with_index dn, unnest(items) dni
+                              where index = 1
+                              group by 1,2,3,4
+                              ),
+monthly_mashup as ( 
+                  select  date_trunc(posting_date, month) as  posting_month,dnwi.company,
+                  coalesce(prd.planned_revenue,0) as planned_revenue,
+                  count(distinct dnwi.customer) as count_of_customers,
+                  sum(dnwi.revenue) as revenue,
+                  count(distinct  sales_order) as order_count,
+                  count(distinct  sales_order) / count(distinct dnwi.customer) as order_frequency,
+                  sum(dnwi.revenue) / count(distinct sales_order) as basket_size,
+                  sum(dnwi.revenue) / count(distinct posting_date) as avg_revenue_per_day_in_month,
+                  sum(dnwi.revenue) / count(distinct dnwi.customer) as monthly_avg_revenue_per_customer
+                  from delivery_note_with_items dnwi
+                  left join planned_revenue_data prd on date_trunc(dnwi.posting_date, month) = prd.start_date and dnwi.company = prd.company 
+                  group by 1,2,3
+                  ),
+monthly_mashup_summary as (
+                            select *,
+                            coalesce(revenue / previous_month_revenue -1,0) as revenue_growth
+                            from
+                            (select *,
+                            lag(revenue)over(partition by company order by posting_month) as previous_month_revenue 
+                            from monthly_mashup
+                            )
+                          ),
+current_month_data as (
+                        select distinct
+                        posting_month,
+                        company,
+                        avg_revenue_per_day_in_month * msd.count_of_sales_days  as revenue_projection,
+                        from monthly_mashup m
+                        left join monthly_sale_days msd on m.posting_month = msd.month
+                        where posting_month = date_trunc(current_date(),month) 
+                      )
+select mms.*,cmd.*except(posting_month,company),
+from monthly_mashup_summary mms 
+left join current_month_data cmd on mms.posting_month = cmd.posting_month and mms.company = cmd.company
+order by 2,1
